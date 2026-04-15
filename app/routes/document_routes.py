@@ -21,6 +21,7 @@ from fastapi import (
     status,
 )
 from langchain_core.documents import Document
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
 import asyncio
@@ -38,6 +39,7 @@ from app.config import (
     CHUNK_OVERLAP,
     EMBEDDING_BATCH_SIZE,
     EMBEDDING_MAX_QUEUE_SIZE,
+    embeddings,
 )
 from app.constants import ERROR_MESSAGES
 from app.models import (
@@ -638,6 +640,50 @@ def generate_digest(page_content: str) -> str:
     return hashlib.md5(page_content.encode("utf-8", "ignore")).hexdigest()
 
 
+_HEADING_MAX_LEN = 80  # lines longer than this are never treated as headings
+
+
+def _split_by_sections(data: List[Document]) -> List[Document]:
+    """
+    Tier-1 PDF splitter: detect heading lines (short + ALL CAPS or Title Case) and
+    split the concatenated page text at those boundaries.  Each section is further
+    split by RecursiveCharacterTextSplitter so no chunk exceeds CHUNK_SIZE.
+    Returns an empty list when no headings are found.
+    """
+    sections: List[tuple] = []  # (text, metadata) pairs
+    current: List[str] = []
+    current_meta: dict = data[0].metadata if data else {}
+
+    for doc in data:
+        for line in doc.page_content.splitlines():
+            stripped = line.strip()
+            is_heading = (
+                stripped
+                and len(stripped) <= _HEADING_MAX_LEN
+                and (stripped.isupper() or stripped.istitle())
+            )
+            if is_heading and current:
+                sections.append(("\n".join(current), current_meta))
+                current = [line]
+                current_meta = doc.metadata
+            else:
+                current.append(line)
+    if current:
+        sections.append(("\n".join(current), current_meta))
+
+    if len(sections) <= 1:
+        return []
+
+    # Sub-split each section to respect CHUNK_SIZE, preserving source metadata
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    result: List[Document] = []
+    for section_text, meta in sections:
+        result.extend(splitter.create_documents([section_text], metadatas=[meta]))
+    return result
+
+
 def _prepare_documents_sync(
     data: Iterable[Document],
     file_id: str,
@@ -647,11 +693,50 @@ def _prepare_documents_sync(
     """
     Synchronous document preparation - runs in executor to avoid blocking event loop.
     Handles text splitting, cleaning, and metadata preparation.
+
+    For PDFs (clean_content=True) a three-tier chunking strategy is used:
+      Tier 1 - Section-based: split at detected heading lines (> 3 chunks required).
+      Tier 2 - SemanticChunker: embedding-driven splits when Tier 1 yields too few chunks.
+      Tier 3 - RecursiveCharacterTextSplitter: character-count fallback (always used for
+               non-PDFs, and as a safety net when Tier 2 fails).
     """
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-    )
-    documents = text_splitter.split_documents(data)
+    if clean_content:
+        # Materialise the iterable once so all tiers can use the same list
+        data_list = list(data)
+
+        # Tier 1 — section-based
+        section_docs = _split_by_sections(data_list)
+        if len(section_docs) > 3:
+            logger.info(
+                "PDF chunking tier=1 (section-based): %d chunks", len(section_docs)
+            )
+            documents = section_docs
+        else:
+            # Tier 2 — SemanticChunker
+            try:
+                semantic_splitter = SemanticChunker(embeddings)
+                documents = semantic_splitter.split_documents(data_list)
+                logger.info(
+                    "PDF chunking tier=2 (semantic): %d chunks", len(documents)
+                )
+            except Exception as e:
+                logger.warning(
+                    "SemanticChunker failed (%s); falling back to tier 3 (recursive)",
+                    e,
+                )
+                # Tier 3 — RecursiveCharacterTextSplitter
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+                )
+                documents = text_splitter.split_documents(data_list)
+                logger.info(
+                    "PDF chunking tier=3 (recursive): %d chunks", len(documents)
+                )
+    else:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+        )
+        documents = text_splitter.split_documents(data)
 
     # If `clean_content` is True, clean the page_content of each document (remove null bytes)
     if clean_content:
