@@ -6,13 +6,13 @@ import tempfile
 
 from typing import Iterator, List, Optional
 import chardet
+import fitz  # pymupdf
 
 from langchain_core.documents import Document
 
 from app.config import known_source_ext, PDF_EXTRACT_IMAGES, CHUNK_OVERLAP, logger
 from langchain_community.document_loaders import (
     TextLoader,
-    PyPDFLoader,
     CSVLoader,
     Docx2txtLoader,
     UnstructuredEPubLoader,
@@ -76,7 +76,7 @@ def get_loader(filename: str, file_content_type: str, filepath: str):
     # File Content Type reference:
     # ref.: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types/Common_types
     if file_ext == "pdf" or file_content_type == "application/pdf":
-        loader = SafePyPDFLoader(filepath, extract_images=PDF_EXTRACT_IMAGES)
+        loader = SafePyMuPDFLoader(filepath, extract_images=PDF_EXTRACT_IMAGES)
     elif file_ext == "csv" or file_content_type == "text/csv":
         # Detect encoding for CSV files
         encoding = detect_file_encoding(filepath)
@@ -215,50 +215,39 @@ def process_documents(documents: List[Document]) -> str:
     return processed_text.strip()
 
 
-class SafePyPDFLoader:
+class SafePyMuPDFLoader:
     """
-    A wrapper around PyPDFLoader that handles image extraction failures gracefully.
-    Falls back to text-only extraction when image extraction fails.
+    PDF loader backed by PyMuPDF (fitz). Yields one Document per page with
+    metadata keys "source" (filepath) and "page" (0-indexed int).
 
-    This is a workaround for issues with PyPDFLoader that can occur when extracting images
-    from PDFs, which can lead to KeyError exceptions if the PDF is malformed or has unsupported
-    image formats. This class attempts to load the PDF with image extraction enabled, and if it
-    fails due to a KeyError related to image filters, it falls back to loading the PDF
-    without image extraction.
-    ref.: https://github.com/langchain-ai/langchain/issues/26652
+    Malformed pages are skipped with a warning rather than crashing. If the
+    file cannot be opened at all, a warning is logged and no documents are
+    yielded.
     """
 
     def __init__(self, filepath: str, extract_images: bool = False):
         self.filepath = filepath
         self.extract_images = extract_images
-        self._temp_filepath = None  # For compatibility with cleanup function
+        self._temp_filepath = None  # For compatibility with cleanup_temp_encoding_file()
 
     def lazy_load(self) -> Iterator[Document]:
-        """Lazy load PDF documents with automatic fallback on image extraction errors."""
-        loader = PyPDFLoader(self.filepath, extract_images=self.extract_images)
-
-        if not self.extract_images:
-            # No image extraction: no fallback needed, stream directly
-            yield from loader.lazy_load()
-            return
-
-        # extract_images=True: must collect eagerly so that a mid-stream
-        # KeyError doesn't leave already-yielded pages duplicated by the
-        # fallback (yield from + try/except would deliver partial + full).
         try:
-            pages = list(loader.lazy_load())
-        except KeyError as e:
-            if "/Filter" in str(e):
-                logger.warning(
-                    f"PDF image extraction failed for {self.filepath}, falling back to text-only: {e}"
+            pdf = fitz.open(self.filepath)
+        except Exception as e:
+            logger.warning(f"PyMuPDF could not open {self.filepath}: {e}")
+            return
+        for page_num in range(len(pdf)):
+            try:
+                text = pdf[page_num].get_text("text")
+                yield Document(
+                    page_content=text,
+                    metadata={"source": self.filepath, "page": page_num},
                 )
-                fallback_loader = PyPDFLoader(self.filepath, extract_images=False)
-                pages = list(fallback_loader.lazy_load())
-            else:
-                # Re-raise if it's a different error
-                raise
-        yield from pages
+            except Exception as e:
+                logger.warning(
+                    f"PyMuPDF failed on page {page_num} of {self.filepath}, skipping: {e}"
+                )
+        pdf.close()
 
     def load(self) -> List[Document]:
-        """Load PDF documents with automatic fallback on image extraction errors."""
         return list(self.lazy_load())
