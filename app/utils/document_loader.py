@@ -3,14 +3,17 @@
 import os
 import codecs
 import tempfile
+import time
 
 from typing import Iterator, List, Optional
 import chardet
 import fitz  # pymupdf
+from google import genai
+from google.genai import types
 
 from langchain_core.documents import Document
 
-from app.config import known_source_ext, PDF_EXTRACT_IMAGES, CHUNK_OVERLAP, logger
+from app.config import known_source_ext, PDF_EXTRACT_IMAGES, CHUNK_OVERLAP, GEMINI_API_KEY, logger
 from langchain_community.document_loaders import (
     TextLoader,
     CSVLoader,
@@ -76,7 +79,7 @@ def get_loader(filename: str, file_content_type: str, filepath: str):
     # File Content Type reference:
     # ref.: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types/Common_types
     if file_ext == "pdf" or file_content_type == "application/pdf":
-        loader = SafePyMuPDFLoader(filepath, extract_images=PDF_EXTRACT_IMAGES)
+        loader = SafePyMuPDFLoader(filepath, extract_images=PDF_EXTRACT_IMAGES, gemini_api_key=GEMINI_API_KEY)
     elif file_ext == "csv" or file_content_type == "text/csv":
         # Detect encoding for CSV files
         encoding = detect_file_encoding(filepath)
@@ -225,10 +228,31 @@ class SafePyMuPDFLoader:
     yielded.
     """
 
-    def __init__(self, filepath: str, extract_images: bool = False):
+    _GEMINI_MIME_TYPES = {
+        "png": "image/png",
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "webp": "image/webp",
+        "heic": "image/heic",
+        "heif": "image/heif",
+    }
+
+    def __init__(self, filepath: str, extract_images: bool = False, gemini_api_key: str = ""):
         self.filepath = filepath
         self.extract_images = extract_images
         self._temp_filepath = None  # For compatibility with cleanup_temp_encoding_file()
+        self._gemini_client = genai.Client(api_key=gemini_api_key) if extract_images and gemini_api_key else None
+
+    def _describe_image(self, image_bytes: bytes, mime_type: str) -> str:
+        response = self._gemini_client.models.generate_content(
+            model="gemini-2.0-flash-lite",
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                "Describe this board game rulebook diagram in detail, including any labels, arrows, positions, or setup instructions shown.",
+            ],
+        )
+        time.sleep(4)
+        return response.text.strip()
 
     def lazy_load(self) -> Iterator[Document]:
         try:
@@ -238,7 +262,32 @@ class SafePyMuPDFLoader:
             return
         for page_num in range(len(pdf)):
             try:
-                text = pdf[page_num].get_text("text")
+                page = pdf[page_num]
+                text = page.get_text("text")
+
+                if self._gemini_client:
+                    for (xref, *_) in page.get_images():
+                        try:
+                            img = pdf.extract_image(xref)
+                            image_bytes = img["image"]
+                            if len(image_bytes) < 100:
+                                continue
+                            ext = img["ext"].lower()
+                            if ext in self._GEMINI_MIME_TYPES:
+                                mime_type = self._GEMINI_MIME_TYPES[ext]
+                            else:
+                                pix = fitz.Pixmap(pdf, xref)
+                                if pix.n > 4:
+                                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                                image_bytes = pix.tobytes("png")
+                                mime_type = "image/png"
+                            description = self._describe_image(image_bytes, mime_type)
+                            text += f"\n[Image: {description}]\n"
+                        except Exception as e:
+                            logger.warning(
+                                f"Gemini image description failed on page {page_num} of {self.filepath}: {e}"
+                            )
+
                 yield Document(
                     page_content=text,
                     metadata={"source": self.filepath, "page": page_num},
